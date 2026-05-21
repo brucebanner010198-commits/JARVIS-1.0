@@ -1,14 +1,10 @@
 import asyncio
 from dotenv import load_dotenv
-from livekit import agents
-from livekit.agents import AgentServer, AgentSession, Agent, room_io
-from livekit.plugins import silero
-from livekit.plugins import openai
-from livekit.plugins import elevenlabs
-from livekit.plugins import langchain
-from langgraph.graph import StateGraph, MessagesState, START, END
-from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import SystemMessage
+from livekit.agents import AutoSubscribe, JobContext, JobProcess, WorkerOptions, cli, llm
+from livekit.agents.voice import AgentSession, Agent
+from livekit.plugins import silero, anthropic, openai, elevenlabs
+from mcp.client.stdio import stdio_client, StdioServerParameters
+from mcp.client.session import ClientSession
 from mem0 import Memory
 import os
 
@@ -33,69 +29,77 @@ except Exception as e:
     print(f"Warning: Could not initialize Mem0 connected to pgvector. Proceeding without persistent memory. Error: {e}")
     memory = None
 
-class Assistant(Agent):
-    def __init__(self):
-        super().__init__(
-            instructions=(
-                "You are J.A.R.V.I.S., an advanced AI assistant. "
-                "Keep your responses concise, clear, and helpful. "
-                "Be proactive, perceptive, and highly functional."
+
+def prewarm(proc: JobProcess):
+    proc.userdata["vad"] = silero.VAD.load()
+
+async def entrypoint(ctx: JobContext):
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+
+    # Setup persistent MCP client session for this job
+    server_params = StdioServerParameters(
+        command="python",
+        args=["mcp_server.py"],
+    )
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as mcp_session:
+            await mcp_session.initialize()
+
+            # Note: We must create a dynamically generated wrapper that calls MCP
+            class FileSystemTools(llm.ToolContext):
+                @llm.function_tool(description="Read a file from the workspace.")
+                async def read_file(self, filename: str) -> str:
+                    result = await mcp_session.call_tool("read_file", arguments={"filename": filename})
+                    return result.content[0].text
+
+                @llm.function_tool(description="Write content to a file in the workspace.")
+                async def write_file(self, filename: str, content: str) -> str:
+                    result = await mcp_session.call_tool("write_file", arguments={"filename": filename, "content": content})
+                    return result.content[0].text
+
+                @llm.function_tool(description="List all files in the workspace.")
+                async def list_files(self) -> str:
+                    result = await mcp_session.call_tool("list_files", arguments={})
+                    return result.content[0].text
+
+            fnc_ctx = FileSystemTools()
+
+            # Using AgentSession correctly based on v1.5 API structure
+            agent_session = AgentSession(
+                vad=ctx.proc.userdata["vad"],
+                stt=openai.STT(),
+                llm=anthropic.LLM(model="claude-3-5-sonnet-20240620"),
+                tts=elevenlabs.TTS(),
+                tools=fnc_ctx.flatten()
             )
-        )
 
-llm = ChatAnthropic(model="claude-3-5-sonnet-20240620")
+            class Assistant(Agent):
+                def __init__(self):
+                    super().__init__(
+                        instructions=(
+                            "You are J.A.R.V.I.S., an advanced AI assistant. "
+                            "Keep your responses concise, clear, and helpful. "
+                            "Be proactive, perceptive, and highly functional. "
+                            "Use the provided tools to interact with the file system when requested."
+                        )
+                    )
 
-# Define LangGraph state machine node
-def call_model(state: MessagesState):
-    messages = state['messages']
+            await agent_session.start(agent=Assistant(), room=ctx.room)
 
-    # Context Injection and Memory Storage via Mem0
-    if memory and messages:
-        last_user_msg = next((m.content for m in reversed(messages) if m.type == "human"), None)
-        if last_user_msg:
-            # Add user message to memory
-            memory.add(messages=last_user_msg, user_id="jarvis_user")
-            # Perform vector search
-            relevant_memories = memory.search(query=last_user_msg, user_id="jarvis_user")
-            if relevant_memories:
-                context = "\n".join([mem["memory"] for mem in relevant_memories])
-                # Inject context as a system message
-                system_msg = SystemMessage(content=f"Relevant historical facts:\n{context}")
-                messages = [system_msg] + messages
+            await asyncio.sleep(1)
+            await agent_session.say("Systems online. I am ready.", allow_interruptions=True)
 
-    response = llm.invoke(messages)
-    return {"messages": [response]}
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                pass
 
-# Build graph
-workflow = StateGraph(MessagesState)
-workflow.add_node("agent", call_model)
-workflow.add_edge(START, "agent")
-workflow.add_edge("agent", END)
-compiled_graph = workflow.compile()
-
-server = AgentServer()
-
-@server.rtc_session(agent_name="jarvis")
-async def jarvis(ctx: agents.JobContext):
-
-    # Phase 2: LangGraph Integration wrapped for LiveKit streaming
-    llm_adapter = langchain.LLMAdapter(graph=compiled_graph)
-
-    session = AgentSession(
-        stt=openai.STT(),
-        llm=llm_adapter,
-        tts=elevenlabs.TTS(),
-        vad=silero.VAD.load(),
-    )
-
-    await session.start(
-        room=ctx.room,
-        agent=Assistant(),
-    )
-
-    await session.generate_reply(
-        instructions="Greet the user and let them know systems are online and you are ready."
-    )
 
 if __name__ == "__main__":
-    agents.cli.run_app(server)
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+        ),
+    )

@@ -1,28 +1,22 @@
-# Phase 2: Contextual Persistence & Stateful Memory Implementation Plan
+# Phase 3: The Tooling Grid & MCP Integration Plan
 
-## 1. Environment & Dependencies Update
-* Add requirements for state and memory management:
-  * `livekit-plugins-langchain` to connect LangGraph state machines to LiveKit's `AgentSession`.
-  * `langgraph` for deterministic state orchestration and tool loops.
-  * `langchain-anthropic` for LLM nodes inside the LangGraph.
-  * `mem0ai` as the core RAG memory layer.
-  * `psycopg2-binary` to enable PostgreSQL `pgvector` connections.
+## 1. Environment & Dependencies Setup
+* Install `mcp` via pip to support the Model Context Protocol.
+* Update `requirements.txt` to include `mcp`.
 
-## 2. Infrastructure Deployment
-* Update `docker-compose.yml` to include a `pgvector` container alongside LiveKit and Redis.
-  * Define environment variables (`POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`).
-  * Expose port `5432` for local python connections.
+## 2. Standalone MCP Server Deployment
+* Create a generic FileSystem MCP server using `mcp.server.fastmcp.FastMCP` in a new file `mcp_server.py`.
+* Ensure strict bounds: This tool reads/writes ONLY to a sandboxed local `./workspace` directory to prevent unauthorized host OS access. Path checks must include trailing slashes to prevent sibling directory traversal.
 
-## 3. LangGraph Orchestration (`agent.py`)
-* Replace the direct `anthropic.LLM()` call in `AgentSession` with `livekit.plugins.langchain.LLMAdapter(graph=compiled_graph)`.
-* Define a `StateGraph` using LangGraph `MessagesState`.
-* Set up a routing node that processes messages using `langchain_anthropic.ChatAnthropic` before returning them to LiveKit.
+## 3. LiveKit Agents MCP Integration (`agent.py`)
+* Use standard LiveKit 1.5.0 components verified against the installed library version (`WorkerOptions`, `JobContext`, `livekit.agents.voice.agent_session.AgentSession`, `llm.ToolContext`, `llm.function_tool`).
+* Instantiate an `mcp.client.stdio.stdio_client` and connect to the MCP server persistently in the entrypoint function.
+* Wrap the MCP client tool invocations using `@llm.function_tool(description="...")` inside an inline class derived from `llm.ToolContext` so that it captures the `mcp_session`. Pass arguments to `call_tool` explicitly as `arguments={"key": val}`.
+* Provide the flattened tool list (`fnc_ctx.flatten()`) to the `AgentSession`.
+* Run the agent logic wrapped inside the MCP context managers.
 
-## 4. Mem0 Context Injection
-* Instantiate the `Mem0` client connected to the local `pgvector` store.
-* Configure the LangGraph node to add user messages to memory, then perform a vector search against Mem0 on each user input.
-* Dynamically prepend the relevant historical facts invisibly into the LangGraph `SystemMessage` before executing the underlying LLM call.
-
-## 5. Local Execution & Testing
-* Start the updated infrastructure (`docker compose up -d`).
-* Verify the Python logic works by executing `python agent.py start`.
+## 4. Local Execution & Testing
+* Ensure the `./workspace` directory is created.
+* Spin up the LiveKit environment (`docker compose up -d`).
+* Start the agent daemon which spawns the MCP server locally (`python agent.py start`).
+* Verify that J.A.R.V.I.S. can securely execute filesystem actions via the tool grid without latency or hallucinating APIs.

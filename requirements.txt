@@ -10,3 +10,4 @@ langchain-core
 langchain-anthropic
 mem0ai
 psycopg2-binary
+mcp
