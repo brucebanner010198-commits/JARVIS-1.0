@@ -11,3 +11,5 @@ langchain-anthropic
 mem0ai
 psycopg2-binary
 mcp
+mss
+pyautogui
